@@ -24,12 +24,14 @@ import (
 	"github.com/containernetworking/cni/pkg/types"
 	"github.com/containernetworking/cni/pkg/types/current"
 	"github.com/containernetworking/cni/pkg/version"
+	"github.com/vishvananda/netlink"
 )
 
 const defaultBrName = "cni0"
 
 type NetConf struct {
 	types.NetConf
+	PrevResult    *current.Result        `json:"prevResult,omitempty"`
 	BrName        string                 `json:"bridge"`
 	IsGW          bool                   `json:"isGateway"`
 	IsDefaultGW   bool                   `json:"isDefaultGateway"`
@@ -58,7 +60,8 @@ func loadNetConf(bytes []byte) (*NetConf, string, error) {
 }
 
 func cmdAdd(args *skel.CmdArgs) error {
-	n, _, err := loadNetConf(args.StdinData)
+	var hostInterface, containerInterface *current.Interface
+	n, cniVersion, err := loadNetConf(args.StdinData)
 	if err != nil {
 		return err
 	}
@@ -67,12 +70,46 @@ func cmdAdd(args *skel.CmdArgs) error {
 		n.IsGW = true
 	}
 
-	_, _, err = bridge.Setup(n.BrName, n.MTU)
+	newResult, err := current.NewResultFromResult(n.PrevResult)
 	if err != nil {
 		return err
 	}
 
-	return types.PrintResult(&current.Result{}, n.CNIVersion)
+	if newResult.Interfaces == nil || len(newResult.Interfaces) < 2 {
+		return fmt.Errorf("invalid plugin chain, expected interfaces %v", newResult)
+	}
+
+	hostInterface = newResult.Interfaces[0]
+	containerInterface = newResult.Interfaces[1]
+
+	if hostInterface == nil || containerInterface == nil {
+		return fmt.Errorf("invalid interface %v", newResult)
+	}
+
+	br, brInterface, err := bridge.Setup(n.BrName, n.MTU)
+	if err != nil {
+		return err
+	}
+
+	// Rebuild the interface list prepending the bridge
+	newResult.Interfaces = []*current.Interface{brInterface, hostInterface, containerInterface}
+
+	// connect host interface to the bridge
+	hostLink, err := netlink.LinkByName(hostInterface.Name)
+	if err != nil {
+		return err
+	}
+	if err := netlink.LinkSetMaster(hostLink, br); err != nil {
+		return fmt.Errorf("failed to connect %q to bridge %v: %v", hostLink.Attrs().Name, br.Attrs().Name, err)
+	}
+
+	// set hairpin mode (we are setting a interface property in the bridge
+	// TODO: this feel wrong, but it cannot be sent
+	if err = netlink.LinkSetHairpin(hostLink, n.HairpinMode); err != nil {
+		return fmt.Errorf("failed to setup hairpin mode for %v: %v", hostLink.Attrs().Name, err)
+	}
+
+	return types.PrintResult(newResult, cniVersion)
 }
 
 func cmdDel(args *skel.CmdArgs) error {

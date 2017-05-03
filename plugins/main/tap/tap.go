@@ -16,21 +16,15 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
-	"net"
 	"runtime"
 
-	"github.com/containernetworking/cni/pkg/bridge"
 	"github.com/containernetworking/cni/pkg/ip"
-	"github.com/containernetworking/cni/pkg/ipam"
 	"github.com/containernetworking/cni/pkg/ns"
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
 	"github.com/containernetworking/cni/pkg/types/current"
-	"github.com/containernetworking/cni/pkg/utils"
 	"github.com/containernetworking/cni/pkg/version"
-	"github.com/vishvananda/netlink"
 )
 
 const defaultBrName = "cni0"
@@ -65,33 +59,36 @@ func loadNetConf(bytes []byte) (*NetConf, string, error) {
 	return n, n.CNIVersion, nil
 }
 
-func setupTap(netns ns.NetNS, br *netlink.Bridge, ifName string, mtu int, hairpinMode bool) (*current.Interface, *current.Interface, error) {
+func setupTap(netns ns.NetNS, ifName string, mtu int) (*current.Interface, *current.Interface, error) {
 	iface := &current.Interface{}
 	hostIface := &current.Interface{}
 
-	// create a tap interface, connect it to the bridge and move it the container ns
-	tap, err := ip.SetupTap(ifName, mtu, netns, br)
+	// create a tap interface, this remains on the host side
+	// and hence needs a unique non conflicting name
+	// The desired name is embedded in the alias
+	tapName, err := ip.RandomVethName()
 	if err != nil {
 		return nil, nil, err
 	}
-	iface.Name = tap.Attrs().Name
+
+	tap, err := ip.SetupTap(tapName, mtu, netns)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Store the desired name and sandbox ID in the alias
+	// This will help identify the interface on the host
+	// when the interface needs to be deleted
+	alias := ifName + "_" + netns.Path()
+	err = ip.SetAlias(tap, alias)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	iface.Name = ifName
 	iface.Mac = tap.Attrs().HardwareAddr.String()
 	iface.Sandbox = netns.Path()
 	hostIface.Name = tap.Attrs().Name
-
-	// need to lookup tap again as its index may have changed during ns move
-	err = netns.Do(func(hostNS ns.NetNS) error {
-		tap, err := netlink.LinkByName(iface.Name)
-		if err != nil {
-			return fmt.Errorf("failed to lookup %q: %v", iface.Name, err)
-		}
-		iface.Mac = tap.Attrs().HardwareAddr.String()
-		return nil
-	})
-
-	if err != nil {
-		return nil, nil, err
-	}
 
 	return hostIface, iface, nil
 }
@@ -108,6 +105,12 @@ func cmdAdd(args *skel.CmdArgs) error {
 		n.IsGW = true
 	}
 
+	netns, err := ns.GetNS(args.Netns)
+	if err != nil {
+		return fmt.Errorf("failed to open netns %q: %v", args.Netns, err)
+	}
+	defer netns.Close()
+
 	vmRuntime, ok := n.RuntimeConfig["configureVM"]
 	if ok {
 		isVMRuntime, ok = vmRuntime.(bool)
@@ -121,159 +124,20 @@ func cmdAdd(args *skel.CmdArgs) error {
 		return types.PrintResult(newResult, cniVersion)
 	}
 
-	br, brInterface, err := bridge.Setup(n.BrName, n.MTU)
+	hostInterface, containerInterface, err = setupTap(netns, args.IfName, n.MTU)
 	if err != nil {
 		return err
 	}
 
-	netns, err := ns.GetNS(args.Netns)
-	if err != nil {
-		return fmt.Errorf("failed to open netns %q: %v", args.Netns, err)
-	}
-	defer netns.Close()
-
-	hostInterface, containerInterface, err = setupTap(netns, br, args.IfName, n.MTU, n.HairpinMode)
-	if err != nil {
-		return err
-	}
-
-	// run the IPAM plugin and get back the config to apply
-	r, err := ipam.ExecAdd(n.IPAM.Type, args.StdinData)
-	if err != nil {
-		return err
-	}
-
-	// Convert whatever the IPAM result was into the current Result type
-	result, err := current.NewResultFromResult(r)
-	if err != nil {
-		return err
-	}
-
-	if len(result.IPs) == 0 {
-		return errors.New("IPAM plugin returned missing IP config")
-	}
-
-	result.Interfaces = []*current.Interface{brInterface, hostInterface, containerInterface}
-
-	for _, ipc := range result.IPs {
-		// All IPs currently refer to the container interface
-		ipc.Interface = 2
-		if ipc.Gateway == nil && n.IsGW {
-			ipc.Gateway = bridge.CalcGatewayIP(&ipc.Address)
-		}
-	}
-
-	if err := netns.Do(func(_ ns.NetNS) error {
-		// set the default gateway if requested
-		if n.IsDefaultGW {
-			for _, ipc := range result.IPs {
-				defaultNet := &net.IPNet{}
-				switch {
-				case ipc.Address.IP.To4() != nil:
-					defaultNet.IP = net.IPv4zero
-					defaultNet.Mask = net.IPMask(net.IPv4zero)
-				case len(ipc.Address.IP) == net.IPv6len && ipc.Address.IP.To4() == nil:
-					defaultNet.IP = net.IPv6zero
-					defaultNet.Mask = net.IPMask(net.IPv6zero)
-				default:
-					return fmt.Errorf("Unknown IP object: %v", ipc)
-				}
-
-				for _, route := range result.Routes {
-					if defaultNet.String() == route.Dst.String() {
-						if route.GW != nil && !route.GW.Equal(ipc.Gateway) {
-							return fmt.Errorf(
-								"isDefaultGateway ineffective because IPAM sets default route via %q",
-								route.GW,
-							)
-						}
-					}
-				}
-
-				result.Routes = append(
-					result.Routes,
-					&types.Route{Dst: *defaultNet, GW: ipc.Gateway},
-				)
-			}
-		}
-
-		if err := ipam.ConfigureIface(args.IfName, result); err != nil {
-			return err
-		}
-
-		if err := ip.SetHWAddrByIP(args.IfName, result.IPs[0].Address.IP, nil /* TODO IPv6 */); err != nil {
-			return err
-		}
-
-		// Refetch the interface since its MAC address may changed
-		link, err := netlink.LinkByName(args.IfName)
-		if err != nil {
-			return fmt.Errorf("could not lookup %q: %v", args.IfName, err)
-		}
-		containerInterface.Mac = link.Attrs().HardwareAddr.String()
-
-		return nil
-	}); err != nil {
-		return err
-	}
-
-	if n.IsGW {
-		var firstV4Addr net.IP
-		for _, ipc := range result.IPs {
-			gwn := &net.IPNet{
-				IP:   ipc.Gateway,
-				Mask: ipc.Address.Mask,
-			}
-			if ipc.Gateway.To4() != nil && firstV4Addr == nil {
-				firstV4Addr = ipc.Gateway
-			}
-
-			if err = bridge.EnsureBridgeAddr(br, gwn, n.ForceAddress); err != nil {
-				return err
-			}
-		}
-
-		if firstV4Addr != nil {
-			if err := ip.SetHWAddrByIP(n.BrName, firstV4Addr, nil /* TODO IPv6 */); err != nil {
-				return err
-			}
-		}
-
-		if err := ip.EnableIP4Forward(); err != nil {
-			return fmt.Errorf("failed to enable forwarding: %v", err)
-		}
-	}
-
-	if n.IPMasq {
-		chain := utils.FormatChainName(n.Name, args.ContainerID)
-		comment := utils.FormatComment(n.Name, args.ContainerID)
-		for _, ipc := range result.IPs {
-			if err = ip.SetupIPMasq(ip.Network(&ipc.Address), chain, comment); err != nil {
-				return err
-			}
-		}
-	}
-
-	// Refetch the bridge since its MAC address may change when the first
-	// veth is added or after its IP address is set
-	br, err = bridge.FindByName(n.BrName)
-	if err != nil {
-		return err
-	}
-	brInterface.Mac = br.Attrs().HardwareAddr.String()
-
-	result.DNS = n.DNS
+	result := &current.Result{}
+	result.Interfaces = []*current.Interface{hostInterface, containerInterface}
 
 	return types.PrintResult(result, cniVersion)
 }
 
 func cmdDel(args *skel.CmdArgs) error {
-	n, _, err := loadNetConf(args.StdinData)
+	_, _, err := loadNetConf(args.StdinData)
 	if err != nil {
-		return err
-	}
-
-	if err := ipam.ExecDel(n.IPAM.Type, args.StdinData); err != nil {
 		return err
 	}
 
@@ -284,25 +148,13 @@ func cmdDel(args *skel.CmdArgs) error {
 	// There is a netns so try to clean up. Delete can be called multiple times
 	// so don't return an error if the device is already removed.
 	// If the device isn't there then don't try to clean up IP masq either.
-	var ipn *net.IPNet
 	err = ns.WithNetNSPath(args.Netns, func(_ ns.NetNS) error {
-		var err error
-		ipn, err = ip.DelLinkByNameAddr(args.IfName, netlink.FAMILY_V4)
-		if err != nil && err == ip.ErrLinkNotFound {
+		err = ip.DelLinkByName(args.IfName)
+		if err != nil {
 			return nil
 		}
 		return err
 	})
-
-	if err != nil {
-		return err
-	}
-
-	if ipn != nil && n.IPMasq {
-		chain := utils.FormatChainName(n.Name, args.ContainerID)
-		comment := utils.FormatComment(n.Name, args.ContainerID)
-		err = ip.TeardownIPMasq(ipn, chain, comment)
-	}
 
 	return err
 }

@@ -171,8 +171,8 @@ func SetupVeth(contVethName string, mtu int, hostNS ns.NetNS) (net.Interface, ne
 	return ifaceFromNetlinkLink(hostVeth), ifaceFromNetlinkLink(contVeth), nil
 }
 
-// SetupTap sets up a vm friendly tap interface and connects it to specified bridge
-func SetupTap(tapName string, mtu int, containerNS ns.NetNS, br *netlink.Bridge) (tap netlink.Link, err error) {
+// SetupTap sets up a vm friendly tap interface
+func SetupTap(tapName string, mtu int, containerNS ns.NetNS) (tap netlink.Link, err error) {
 	tap, err = makeTap(tapName, mtu)
 	if err != nil {
 		return
@@ -189,26 +189,18 @@ func SetupTap(tapName string, mtu int, containerNS ns.NetNS, br *netlink.Bridge)
 		return
 	}
 
-	// connect tap to the bridge
-	err = netlink.LinkSetMaster(tap, br)
-	if err != nil {
-		err = fmt.Errorf("failed to connect %q to bridge %v: %v", tap.Attrs().Name, br.Attrs().Name, err)
-		return
-	}
-
-	err = netlink.LinkSetUp(tap)
-	if err != nil {
-		err = fmt.Errorf("failed to set %q up: %v", tapName, err)
-		return
-	}
-
-	err = netlink.LinkSetNsFd(tap, int(containerNS.Fd()))
-	if err != nil {
-		err = fmt.Errorf("failed to move tap to the container netns: %v", err)
-		return
-	}
-
 	return
+}
+
+// SetAlias sets the alias on any specified network interface
+func SetAlias(iface netlink.Link, alias string) error {
+
+	if err := netlink.LinkSetAlias(iface, alias); err != nil {
+		err = fmt.Errorf("failed to set alias %q on: %v", alias, iface)
+		return err
+	}
+
+	return nil
 }
 
 // DelLinkByName removes an interface link.
